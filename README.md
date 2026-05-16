@@ -1,4 +1,4 @@
-# volkey
+# VolKey
 
 Per-application volume control with global hotkeys for Fedora / PipeWire (Wayland).
 Lets you bind keys like `Ctrl+Volume Up` to raise Applications volumes independently

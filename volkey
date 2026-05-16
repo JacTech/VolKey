@@ -12,7 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "1.5.0"
+VERSION = "1.4.0"
 
 CONFIG_PATH = Path(os.environ.get("VOLKEY_CONFIG", Path.home() / ".config" / "volkey" / "config.json"))
 SERVICE_PATH = Path.home() / ".config" / "systemd" / "user" / "volkey.service"
@@ -253,8 +253,7 @@ def cmd_help(_args):
         ],
 
         "Audio & Applications": [
-            ("list",       "List active audio streams with index and volume"),
-            ("apps",       "List app names currently playing audio"),
+            ("applist",    "List apps currently playing audio with volume"),
             ("granularity [<1-50>]",
              "Show or set the volume step size"),
         ],
@@ -295,6 +294,7 @@ def cmd_help(_args):
 
     print("Examples")
     print("--------")
+    print("  volkey applist")
     print("  volkey keyset_up firefox ctrl")
     print("  volkey keyset_down discord ctrl+shift")
     print("  volkey granularity 10")
@@ -310,31 +310,20 @@ def cmd_help(_args):
 def cmd_version(_args):
     print(f"VolKey v{VERSION}")
 
-def cmd_list(_args):
-    streams = get_sink_inputs()
-    if not streams:
-        print("No active audio streams.")
-        return
-    print(f"{'INDEX':<8} {'APP NAME':<30} {'VOLUME':>7}  MUTED")
-    print("-" * 56)
-    for s in streams:
-        muted = "yes" if s["muted"] else ""
-        print(f"{s['index']:<8} {s['app_name']:<30} {s['volume_pct']:>6}%  {muted}")
-
-def cmd_apps(_args):
+def cmd_applist(_args):
     streams = get_sink_inputs()
     if not streams:
         print("No active audio streams found.")
         print("(Something must be playing audio for it to appear here.)")
         return
-    print("Apps currently playing audio:\n")
+    print(f"{'APP NAME':<30} {'VOLUME':>7}")
+    print("-" * 38)
     seen = set()
     for s in streams:
         name = s["app_name"]
         if name not in seen:
-            print(f"  {name}")
+            print(f"{name:<30} {s['volume_pct']:>6}%")
             seen.add(name)
-    print(f"\nUse these names with keyset_up / keyset_down, or in your config directly.")
 
 def cmd_keylist(_args):
     config = load_config()
@@ -634,8 +623,7 @@ def main():
     sub.add_parser("start")
     sub.add_parser("stop")
     sub.add_parser("_listen")
-    sub.add_parser("list")
-    sub.add_parser("apps")
+    sub.add_parser("applist")
     sub.add_parser("keylist")
     sub.add_parser("status")
     sub.add_parser("config")
@@ -677,8 +665,7 @@ def main():
         "start":       cmd_start,
         "stop":        cmd_stop,
         "_listen":     cmd_listen,
-        "list":        cmd_list,
-        "apps":        cmd_apps,
+        "applist":     cmd_applist,
         "keylist":     cmd_keylist,
         "keyset_up":   cmd_keyset_up,
         "keyset_down": cmd_keyset_down,
