@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-volkey - Per-application volume control with global hotkeys.
+VolKey - Per-application volume control with global hotkeys.
 Fedora / PipeWire (pactl compatible).
 """
 
@@ -12,7 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 CONFIG_PATH = Path(os.environ.get("VOLKEY_CONFIG", Path.home() / ".config" / "volkey" / "config.json"))
 SERVICE_PATH = Path.home() / ".config" / "systemd" / "user" / "volkey.service"
@@ -21,14 +21,7 @@ INSTALL_PATH = Path("/usr/local/bin/volkey")
 DEFAULT_CONFIG = {
     "notify": False,
     "step": 5,
-    "bindings": [
-        {"keys": ["ctrl",  "volume_up"],          "app": "firefox",  "delta":  5},
-        {"keys": ["ctrl",  "volume_down"],         "app": "firefox",  "delta": -5},
-        {"keys": ["shift", "volume_up"],           "app": "discord",  "delta":  5},
-        {"keys": ["shift", "volume_down"],         "app": "discord",  "delta": -5},
-        {"keys": ["ctrl", "shift", "volume_up"],   "app": "spotify",  "delta":  5},
-        {"keys": ["ctrl", "shift", "volume_down"], "app": "spotify",  "delta": -5},
-    ],
+    "bindings": [],
 }
 
 VALID_MODIFIERS = ["ctrl", "shift", "alt"]
@@ -42,8 +35,8 @@ def load_config() -> dict:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(CONFIG_PATH, "w") as f:
             json.dump(DEFAULT_CONFIG, f, indent=2)
-        print(f"[volkey] Created default config at {CONFIG_PATH}")
-        print(f"[volkey] Edit it to set your apps and hotkeys.\n")
+        print(f"[VolKey] Created default config at {CONFIG_PATH}")
+        print(f"[VolKey] Edit it to set your apps and hotkeys.\n")
     with open(CONFIG_PATH) as f:
         return json.load(f)
 
@@ -58,7 +51,7 @@ def get_sink_inputs() -> list[dict]:
     try:
         out = subprocess.check_output(["pactl", "list", "sink-inputs"], text=True)
     except FileNotFoundError:
-        print("[volkey] `pactl` not found. Install pipewire-pulseaudio.")
+        print("[VolKey] `pactl` not found. Install pipewire-pulseaudio.")
         sys.exit(1)
 
     streams = []
@@ -96,15 +89,15 @@ def set_volume(sink_index: str, volume_pct: int):
 def change_volume(app_pattern: str, delta: int, notify: bool = False):
     streams = find_streams_for_app(app_pattern)
     if not streams:
-        msg = f"[volkey] No active audio stream matching '{app_pattern}'"
+        msg = f"[VolKey] No active audio stream matching '{app_pattern}'"
         print(msg)
         if notify:
-            _notify("volkey", msg, urgency="low")
+            _notify("VolKey", msg, urgency="low")
         return
     for s in streams:
         new_vol = max(0, min(150, s["volume_pct"] + delta))
         set_volume(s["index"], new_vol)
-        print(f"[volkey] {s['app_name']} -> {new_vol}%")
+        print(f"[VolKey] {s['app_name']} -> {new_vol}%")
         if notify:
             _notify(f"🔊 {s['app_name']}", f"Volume: {new_vol}%")
 
@@ -160,7 +153,7 @@ def start_listener(config: dict):
         import asyncio
         import threading
     except ImportError:
-        print("[volkey] evdev not installed. Run: pip install evdev")
+        print("[VolKey] evdev not installed. Run: pip install evdev")
         sys.exit(1)
 
     key_map = _build_key_map()
@@ -174,7 +167,7 @@ def start_listener(config: dict):
         ok = True
         for k in keys_str:
             if k not in key_map:
-                print(f"[volkey] Unknown key '{k}' in binding {b}, skipping.")
+                print(f"[VolKey] Unknown key '{k}' in binding {b}, skipping.")
                 ok = False
                 break
             codes = key_map[k]
@@ -187,7 +180,7 @@ def start_listener(config: dict):
 
     devices = _find_input_devices()
     if not devices:
-        print("[volkey] No readable input devices found.")
+        print("[VolKey] No readable input devices found.")
         print("  Make sure you are in the 'input' group:")
         print("    sudo usermod -aG input $USER   (then log out and back in)")
         sys.exit(1)
@@ -370,6 +363,12 @@ def _parse_key_combo(combo_str: str) -> list[str]:
         sys.exit(1)
     return keys
 
+def _reload_if_running():
+    """Restart the service if it is currently active so changes take effect immediately."""
+    if _service_is_active():
+        subprocess.run(["systemctl", "--user", "restart", "volkey.service"], capture_output=True)
+        print("[VolKey] Service restarted — changes are live.")
+
 def _set_binding(app: str, modifiers_str: str, action_key: str):
     combo = _parse_key_combo(modifiers_str)
     if action_key in combo:
@@ -390,7 +389,7 @@ def _set_binding(app: str, modifiers_str: str, action_key: str):
     keys_display = "+".join(full_keys)
     sign = "+" if delta > 0 else ""
     print(f"Binding set: {keys_display}  ->  {app}  {sign}{delta}%")
-    print("Restart `volkey start` (or the service) for changes to take effect.")
+    _reload_if_running()
 
 def cmd_keyset_up(args):
     _set_binding(args.app, args.keys, "volume_up")
@@ -420,7 +419,7 @@ def _remove_bindings(app: str, action_key: str | None = None):
     config["bindings"] = bindings
     save_config(config)
     print(f"Removed {removed} binding(s) for '{app}'.")
-    print("Restart `volkey start` (or the service) for changes to take effect.")
+    _reload_if_running()
 
 def cmd_keyrm_up(args):
     _remove_bindings(args.app, "volume_up")
@@ -442,17 +441,17 @@ def cmd_status(_args):
         subprocess.run(["systemctl", "--user", "status", "volkey.service", "--no-pager", "-l"])
     elif state == "inactive":
         print("Service: installed but not running.")
-        print("Start it with: systemctl --user start volkey.service")
+        print("Start it with: volkey start")
     else:
         print("Service: not installed.")
-        print("Run manually with: volkey start")
+        print("Run with: volkey start")
 
 def cmd_config(_args):
     print(CONFIG_PATH)
 
 SERVICE_UNIT = """\
 [Unit]
-Description=volkey — per-application volume hotkeys
+Description=VolKey — per-application volume hotkeys
 After=graphical-session.target
 PartOf=graphical-session.target
 
@@ -476,6 +475,20 @@ def _service_is_enabled() -> bool:
 def _service_file_exists() -> bool:
     return SERVICE_PATH.exists()
 
+def _service_is_active() -> bool:
+    r = subprocess.run(
+        ["systemctl", "--user", "is-active", "volkey.service"],
+        capture_output=True, text=True
+    )
+    return r.stdout.strip() == "active"
+
+def _ensure_service_file():
+    """Install the service file if it isn't there yet."""
+    if not SERVICE_PATH.exists():
+        SERVICE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SERVICE_PATH.write_text(SERVICE_UNIT)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+
 def cmd_autostart(args):
     action = args.action
 
@@ -484,7 +497,7 @@ def cmd_autostart(args):
             print("Autostart: not installed")
             print("  Enable with: volkey autostart on")
         elif _service_is_enabled():
-            print("Autostart: enabled  (volkey starts on login)")
+            print("Autostart: enabled  (VolKey starts on login)")
             print("  Disable with: volkey autostart off")
         else:
             print("Autostart: disabled")
@@ -498,14 +511,14 @@ def cmd_autostart(args):
             subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
             print("Service file installed.")
         subprocess.run(["systemctl", "--user", "enable", "--now", "volkey.service"], check=True)
-        print("Autostart enabled — volkey will start on next login and is running now.")
+        print("Autostart enabled — VolKey will start on next login and is running now.")
 
     elif action == "off":
         if not _service_file_exists():
             print("Autostart is not installed, nothing to do.")
             return
         subprocess.run(["systemctl", "--user", "disable", "--now", "volkey.service"], check=True)
-        print("Autostart disabled — volkey will no longer start on login.")
+        print("Autostart disabled — VolKey will no longer start on login.")
 
 def cmd_granularity(args):
     config = load_config()
@@ -532,7 +545,7 @@ def cmd_granularity(args):
             b["delta"] = step if b["delta"] > 0 else -step
     save_config(config)
     print(f"Granularity changed: {old_step}% → {step}%  (all bindings updated)")
-    print("Restart `volkey start` (or the service) for changes to take effect.")
+    _reload_if_running()
 
 def cmd_uninstall(_args):
     print("This will remove:\n")
@@ -548,7 +561,7 @@ def cmd_uninstall(_args):
             found_any = True
 
     if not found_any:
-        print("  Nothing to remove — volkey doesn't appear to be installed.")
+        print("  Nothing to remove — VolKey doesn't appear to be installed.")
         return
 
     print()
@@ -574,25 +587,11 @@ def cmd_uninstall(_args):
         shutil.rmtree(CONFIG_PATH.parent)
         print("Removed config.")
 
-    print("\nvolkey uninstalled.")
-
-def _service_is_active() -> bool:
-    r = subprocess.run(
-        ["systemctl", "--user", "is-active", "volkey.service"],
-        capture_output=True, text=True
-    )
-    return r.stdout.strip() == "active"
-
-def _ensure_service_file():
-    """Install the service file if it isn't there yet."""
-    if not SERVICE_PATH.exists():
-        SERVICE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SERVICE_PATH.write_text(SERVICE_UNIT)
-        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    print("\nVolKey uninstalled.")
 
 def cmd_start(_args):
     if _service_is_active():
-        print("volkey is already running.")
+        print("VolKey is already running.")
         return
     _ensure_service_file()
     result = subprocess.run(
@@ -600,23 +599,23 @@ def cmd_start(_args):
         capture_output=True, text=True
     )
     if result.returncode == 0:
-        print("volkey started.")
+        print("VolKey started.")
     else:
-        print("Failed to start volkey:")
+        print("Failed to start VolKey:")
         print(result.stderr.strip())
 
 def cmd_stop(_args):
     if not _service_is_active():
-        print("volkey is not running.")
+        print("VolKey is not running.")
         return
     result = subprocess.run(
         ["systemctl", "--user", "stop", "volkey.service"],
         capture_output=True, text=True
     )
     if result.returncode == 0:
-        print("volkey stopped.")
+        print("VolKey stopped.")
     else:
-        print("Failed to stop volkey:")
+        print("Failed to stop VolKey:")
         print(result.stderr.strip())
 
 def cmd_listen(_args):

@@ -1,8 +1,14 @@
 # volkey
 
 Per-application volume control with global hotkeys for Fedora / PipeWire (Wayland).
-
 Lets you bind keys like `Ctrl+Volume Up` to raise Applications volumes independently
+
+---
+
+## Disclamer
+
+This project was mostly Vibe-Coded in a matter of hours, since i just wanted a tool to change App Volumes with a hotkey, i personaly have a limited understanding of Python :).
+I just thought id share it, since i didnt find any tool like it. 
 
 ---
 
