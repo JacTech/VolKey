@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+"""
+volkey - Per-application volume control with global hotkeys.
+Fedora / PipeWire (pactl compatible).
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+VERSION = "1.4.0"
+
+CONFIG_PATH = Path(os.environ.get("VOLKEY_CONFIG", Path.home() / ".config" / "volkey" / "config.json"))
+SERVICE_PATH = Path.home() / ".config" / "systemd" / "user" / "volkey.service"
+INSTALL_PATH = Path("/usr/local/bin/volkey")
+
+DEFAULT_CONFIG = {
+    "notify": False,
+    "step": 5,
+    "bindings": [
+        {"keys": ["ctrl",  "volume_up"],          "app": "firefox",  "delta":  5},
+        {"keys": ["ctrl",  "volume_down"],         "app": "firefox",  "delta": -5},
+        {"keys": ["shift", "volume_up"],           "app": "discord",  "delta":  5},
+        {"keys": ["shift", "volume_down"],         "app": "discord",  "delta": -5},
+        {"keys": ["ctrl", "shift", "volume_up"],   "app": "spotify",  "delta":  5},
+        {"keys": ["ctrl", "shift", "volume_down"], "app": "spotify",  "delta": -5},
+    ],
+}
+
+VALID_MODIFIERS = ["ctrl", "shift", "alt"]
+VALID_ACTION_KEYS = ["volume_up", "volume_down", "volume_mute"]
+ALL_VALID_KEYS = VALID_MODIFIERS + VALID_ACTION_KEYS
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(DEFAULT_CONFIG, f, indent=2)
+        print(f"[volkey] Created default config at {CONFIG_PATH}")
+        print(f"[volkey] Edit it to set your apps and hotkeys.\n")
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+def save_config(config: dict):
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+# ── PulseAudio / PipeWire helpers ──────────────────────────────────────────────
+
+def get_sink_inputs() -> list[dict]:
+    try:
+        out = subprocess.check_output(["pactl", "list", "sink-inputs"], text=True)
+    except FileNotFoundError:
+        print("[volkey] `pactl` not found. Install pipewire-pulseaudio.")
+        sys.exit(1)
+
+    streams = []
+    current: dict = {}
+    for line in out.splitlines():
+        line = line.strip()
+        m = re.match(r"^Sink Input #(\d+)$", line)
+        if m:
+            if current:
+                streams.append(current)
+            current = {"index": m.group(1), "app_name": "", "volume_pct": 0, "muted": False}
+            continue
+        m = re.match(r"application\.name\s*=\s*\"(.+?)\"", line)
+        if m and current:
+            current["app_name"] = m.group(1)
+            continue
+        m = re.match(r"Mute:\s*(yes|no)", line)
+        if m and current:
+            current["muted"] = m.group(1) == "yes"
+            continue
+        m = re.match(r"Volume:.+?(\d+)%", line)
+        if m and current:
+            current["volume_pct"] = int(m.group(1))
+    if current:
+        streams.append(current)
+    return streams
+
+def find_streams_for_app(app_pattern: str) -> list[dict]:
+    return [s for s in get_sink_inputs() if app_pattern.lower() in s["app_name"].lower()]
+
+def set_volume(sink_index: str, volume_pct: int):
+    volume_pct = max(0, min(150, volume_pct))
+    subprocess.run(["pactl", "set-sink-input-volume", sink_index, f"{volume_pct}%"], check=True)
+
+def change_volume(app_pattern: str, delta: int, notify: bool = False):
+    streams = find_streams_for_app(app_pattern)
+    if not streams:
+        msg = f"[volkey] No active audio stream matching '{app_pattern}'"
+        print(msg)
+        if notify:
+            _notify("volkey", msg, urgency="low")
+        return
+    for s in streams:
+        new_vol = max(0, min(150, s["volume_pct"] + delta))
+        set_volume(s["index"], new_vol)
+        print(f"[volkey] {s['app_name']} -> {new_vol}%")
+        if notify:
+            _notify(f"🔊 {s['app_name']}", f"Volume: {new_vol}%")
+
+def _notify(summary: str, body: str, urgency: str = "normal"):
+    try:
+        subprocess.run(
+            ["notify-send", "-u", urgency, "-t", "1500", summary, body],
+            check=False, capture_output=True
+        )
+    except FileNotFoundError:
+        pass
+
+# ── Hotkey listener (evdev — works on Wayland) ────────────────────────────────
+
+def _build_key_map():
+    try:
+        from evdev import ecodes
+    except ImportError:
+        return None
+    return {
+        "ctrl":         {ecodes.KEY_LEFTCTRL,  ecodes.KEY_RIGHTCTRL},
+        "shift":        {ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT},
+        "alt":          {ecodes.KEY_LEFTALT,   ecodes.KEY_RIGHTALT},
+        "volume_up":    {ecodes.KEY_VOLUMEUP},
+        "volume_down":  {ecodes.KEY_VOLUMEDOWN},
+        "volume_mute":  {ecodes.KEY_MUTE},
+    }
+
+def _find_input_devices():
+    """Return all readable keyboard-like input devices."""
+    from evdev import InputDevice, ecodes, list_devices
+    devices = []
+    for path in list_devices():
+        try:
+            dev = InputDevice(path)
+            caps = dev.capabilities()
+            keys = caps.get(ecodes.EV_KEY, [])
+            interesting = {
+                ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL,
+                ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT,
+                ecodes.KEY_VOLUMEUP, ecodes.KEY_VOLUMEDOWN, ecodes.KEY_MUTE,
+            }
+            if interesting & set(keys):
+                devices.append(dev)
+        except (PermissionError, OSError):
+            pass
+    return devices
+
+def start_listener(config: dict):
+    try:
+        import evdev
+        from evdev import ecodes, KeyEvent
+        import asyncio
+        import threading
+    except ImportError:
+        print("[volkey] evdev not installed. Run: pip install evdev")
+        sys.exit(1)
+
+    key_map = _build_key_map()
+    notify  = config.get("notify", False)
+
+    hotkeys = []
+    for b in config.get("bindings", []):
+        keys_str   = [k.lower() for k in b["keys"]]
+        modifiers  = set()
+        action_set = set()
+        ok = True
+        for k in keys_str:
+            if k not in key_map:
+                print(f"[volkey] Unknown key '{k}' in binding {b}, skipping.")
+                ok = False
+                break
+            codes = key_map[k]
+            if k in VALID_MODIFIERS:
+                modifiers |= codes
+            else:
+                action_set |= codes
+        if ok and action_set:
+            hotkeys.append((modifiers, action_set, b["app"], b["delta"]))
+
+    devices = _find_input_devices()
+    if not devices:
+        print("[volkey] No readable input devices found.")
+        print("  Make sure you are in the 'input' group:")
+        print("    sudo usermod -aG input $USER   (then log out and back in)")
+        sys.exit(1)
+
+    all_modifier_codes = set()
+    for mods, _, _, _ in hotkeys:
+        all_modifier_codes |= mods
+
+    held = set()
+
+    async def handle_device(dev):
+        from evdev import KeyEvent
+        try:
+            async for event in dev.async_read_loop():
+                if event.type != ecodes.EV_KEY:
+                    continue
+                code  = event.code
+                state = event.value  # 1=down, 0=up, 2=hold
+
+                if state == 1:  # key down
+                    held.add(code)
+                    for mod_codes, action_codes, app, delta in hotkeys:
+                        if code in action_codes:
+                            all_mods_held = True
+                            for name in VALID_MODIFIERS:
+                                group = key_map[name]
+                                if group & mod_codes:      # modifier is required
+                                    if not (group & held): # but none of its keys are held
+                                        all_mods_held = False
+                                        break
+                                else:                      # modifier is NOT required
+                                    if group & held:       # but one of its keys is held
+                                        all_mods_held = False
+                                        break
+                            if all_mods_held:
+                                change_volume(app, delta, notify=notify)
+                elif state == 0:  # key up
+                    held.discard(code)
+        except (OSError, KeyboardInterrupt):
+            pass
+
+    print(f"[VolKey] v{VERSION} — listening for hotkeys (evdev). Ctrl+C to quit.\n")
+    for mod_codes, action_codes, app, delta in hotkeys:
+        mod_names  = [n for n in VALID_MODIFIERS if key_map[n] & mod_codes]
+        act_names  = [n for n in VALID_ACTION_KEYS if key_map[n] & action_codes]
+        combo      = "+".join(mod_names + act_names)
+        sign       = "+" if delta > 0 else ""
+        print(f"  {combo:40s}  ->  {app}  {sign}{delta}%")
+    print(f"\n  Listening on: {', '.join(d.path for d in devices)}\n")
+
+    loop = asyncio.new_event_loop()
+    tasks = [loop.create_task(handle_device(d)) for d in devices]
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        for t in tasks:
+            t.cancel()
+        print("\n[VolKey] Stopped.")
+
+# ── Command implementations ────────────────────────────────────────────────────
+
+def cmd_help(_args):
+    sections = {
+        "Service Management": [
+            ("start",      "Start the VolKey background service"),
+            ("stop",       "Stop the VolKey background service"),
+            ("status",     "Show whether the background service is running"),
+            ("autostart [on|off]",
+             "Show or toggle start-on-login via systemd"),
+        ],
+
+        "Audio & Applications": [
+            ("list",       "List active audio streams with index and volume"),
+            ("apps",       "List app names currently playing audio"),
+            ("granularity [<1-50>]",
+             "Show or set the volume step size"),
+        ],
+
+        "Keybindings": [
+            ("keylist",
+             "Show all configured keybindings"),
+
+            ("keyset_up <app> <keys>",
+             "Set volume-up binding"),
+            ("keyset_down <app> <keys>",
+             "Set volume-down binding"),
+
+            ("keyrm_up <app>",
+             "Remove volume-up binding"),
+            ("keyrm_down <app>",
+             "Remove volume-down binding"),
+            ("keyrm <app>",
+             "Remove ALL bindings for an app"),
+        ],
+
+        "Utility": [
+            ("config",     "Print the config file path"),
+            ("version",    "Show version number"),
+            ("help",       "Show this help message"),
+            ("uninstall",  "Remove VolKey from the system"),
+        ]
+    }
+
+    for section, commands in sections.items():
+        print(f"{section}")
+        print("-" * len(section))
+
+        for name, desc in commands:
+            print(f"  {name:<36} {desc}")
+
+        print()
+
+    print("Examples")
+    print("--------")
+    print("  volkey keyset_up firefox ctrl")
+    print("  volkey keyset_down discord ctrl+shift")
+    print("  volkey granularity 10")
+
+    print("\nKey Syntax")
+    print("----------")
+    print(f"  Valid modifier keys : {', '.join(VALID_MODIFIERS)}")
+    print(f"  Valid action keys   : {', '.join(VALID_ACTION_KEYS)}")
+    print("  Combos              : separate with +")
+    print("                         e.g. ctrl+alt, ctrl+shift+alt")
+
+
+def cmd_version(_args):
+    print(f"VolKey v{VERSION}")
+
+def cmd_list(_args):
+    streams = get_sink_inputs()
+    if not streams:
+        print("No active audio streams.")
+        return
+    print(f"{'INDEX':<8} {'APP NAME':<30} {'VOLUME':>7}  MUTED")
+    print("-" * 56)
+    for s in streams:
+        muted = "yes" if s["muted"] else ""
+        print(f"{s['index']:<8} {s['app_name']:<30} {s['volume_pct']:>6}%  {muted}")
+
+def cmd_apps(_args):
+    streams = get_sink_inputs()
+    if not streams:
+        print("No active audio streams found.")
+        print("(Something must be playing audio for it to appear here.)")
+        return
+    print("Apps currently playing audio:\n")
+    seen = set()
+    for s in streams:
+        name = s["app_name"]
+        if name not in seen:
+            print(f"  {name}")
+            seen.add(name)
+    print(f"\nUse these names with keyset_up / keyset_down, or in your config directly.")
+
+def cmd_keylist(_args):
+    config = load_config()
+    bindings = config.get("bindings", [])
+    if not bindings:
+        print("No keybindings configured.")
+        return
+    print(f"{'KEYS':<40} {'APP':<20} {'DELTA'}")
+    print("-" * 68)
+    for b in bindings:
+        keys = "+".join(b["keys"])
+        sign = "+" if b["delta"] > 0 else ""
+        print(f"{keys:<40} {b['app']:<20} {sign}{b['delta']}%")
+
+def _parse_key_combo(combo_str: str) -> list[str]:
+    keys = [k.strip().lower() for k in combo_str.split("+")]
+    for k in keys:
+        if k not in ALL_VALID_KEYS:
+            print(f"Unknown key: '{k}'")
+            print(f"  Modifiers  : {', '.join(VALID_MODIFIERS)}")
+            print(f"  Action keys: {', '.join(VALID_ACTION_KEYS)}")
+            sys.exit(1)
+    action_keys = [k for k in keys if k in VALID_ACTION_KEYS]
+    if len(action_keys) > 1:
+        print(f"Only one action key allowed per binding (got: {action_keys})")
+        sys.exit(1)
+    return keys
+
+def _set_binding(app: str, modifiers_str: str, action_key: str):
+    combo = _parse_key_combo(modifiers_str)
+    if action_key in combo:
+        combo.remove(action_key)
+    full_keys = combo + [action_key]
+
+    config = load_config()
+    bindings = config.get("bindings", [])
+    bindings = [
+        b for b in bindings
+        if not (b["app"].lower() == app.lower() and action_key in b["keys"])
+    ]
+    delta = 5 if action_key == "volume_up" else -5
+    bindings.append({"keys": full_keys, "app": app, "delta": delta})
+    config["bindings"] = bindings
+    save_config(config)
+
+    keys_display = "+".join(full_keys)
+    sign = "+" if delta > 0 else ""
+    print(f"Binding set: {keys_display}  ->  {app}  {sign}{delta}%")
+    print("Restart `volkey start` (or the service) for changes to take effect.")
+
+def cmd_keyset_up(args):
+    _set_binding(args.app, args.keys, "volume_up")
+
+def cmd_keyset_down(args):
+    _set_binding(args.app, args.keys, "volume_down")
+
+def _remove_bindings(app: str, action_key: str | None = None):
+    """Remove bindings for an app, optionally filtered to one action key."""
+    config = load_config()
+    bindings = config.get("bindings", [])
+    before = len(bindings)
+
+    if action_key:
+        bindings = [
+            b for b in bindings
+            if not (b["app"].lower() == app.lower() and action_key in b["keys"])
+        ]
+    else:
+        bindings = [b for b in bindings if b["app"].lower() != app.lower()]
+
+    removed = before - len(bindings)
+    if removed == 0:
+        print(f"No matching bindings found for '{app}'.")
+        return
+
+    config["bindings"] = bindings
+    save_config(config)
+    print(f"Removed {removed} binding(s) for '{app}'.")
+    print("Restart `volkey start` (or the service) for changes to take effect.")
+
+def cmd_keyrm_up(args):
+    _remove_bindings(args.app, "volume_up")
+
+def cmd_keyrm_down(args):
+    _remove_bindings(args.app, "volume_down")
+
+def cmd_keyrm(args):
+    _remove_bindings(args.app)
+
+def cmd_status(_args):
+    result = subprocess.run(
+        ["systemctl", "--user", "is-active", "volkey.service"],
+        capture_output=True, text=True
+    )
+    state = result.stdout.strip()
+    if state == "active":
+        print("Service: running")
+        subprocess.run(["systemctl", "--user", "status", "volkey.service", "--no-pager", "-l"])
+    elif state == "inactive":
+        print("Service: installed but not running.")
+        print("Start it with: systemctl --user start volkey.service")
+    else:
+        print("Service: not installed.")
+        print("Run manually with: volkey start")
+
+def cmd_config(_args):
+    print(CONFIG_PATH)
+
+SERVICE_UNIT = """\
+[Unit]
+Description=volkey — per-application volume hotkeys
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/volkey _listen
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
+"""
+
+def _service_is_enabled() -> bool:
+    r = subprocess.run(
+        ["systemctl", "--user", "is-enabled", "volkey.service"],
+        capture_output=True, text=True
+    )
+    return r.stdout.strip() == "enabled"
+
+def _service_file_exists() -> bool:
+    return SERVICE_PATH.exists()
+
+def cmd_autostart(args):
+    action = args.action
+
+    if action is None:
+        if not _service_file_exists():
+            print("Autostart: not installed")
+            print("  Enable with: volkey autostart on")
+        elif _service_is_enabled():
+            print("Autostart: enabled  (volkey starts on login)")
+            print("  Disable with: volkey autostart off")
+        else:
+            print("Autostart: disabled")
+            print("  Enable with: volkey autostart on")
+        return
+
+    if action == "on":
+        if not _service_file_exists():
+            SERVICE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            SERVICE_PATH.write_text(SERVICE_UNIT)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+            print("Service file installed.")
+        subprocess.run(["systemctl", "--user", "enable", "--now", "volkey.service"], check=True)
+        print("Autostart enabled — volkey will start on next login and is running now.")
+
+    elif action == "off":
+        if not _service_file_exists():
+            print("Autostart is not installed, nothing to do.")
+            return
+        subprocess.run(["systemctl", "--user", "disable", "--now", "volkey.service"], check=True)
+        print("Autostart disabled — volkey will no longer start on login.")
+
+def cmd_granularity(args):
+    config = load_config()
+
+    if args.value is None:
+        step = config.get("step", 5)
+        print(f"Granularity: {step}%  (volume change per keypress)")
+        return
+
+    try:
+        step = int(args.value)
+    except ValueError:
+        print(f"Invalid value '{args.value}'. Use a number between 1 and 50.")
+        sys.exit(1)
+
+    if not 1 <= step <= 50:
+        print(f"Value must be between 1 and 50 (got {step}).")
+        sys.exit(1)
+
+    old_step = config.get("step", 5)
+    config["step"] = step
+    for b in config.get("bindings", []):
+        if b["delta"] != 0:
+            b["delta"] = step if b["delta"] > 0 else -step
+    save_config(config)
+    print(f"Granularity changed: {old_step}% → {step}%  (all bindings updated)")
+    print("Restart `volkey start` (or the service) for changes to take effect.")
+
+def cmd_uninstall(_args):
+    print("This will remove:\n")
+    items = [
+        (INSTALL_PATH.exists(),       f"  {INSTALL_PATH}  (the script)"),
+        (SERVICE_PATH.exists(),       f"  {SERVICE_PATH}  (systemd service)"),
+        (CONFIG_PATH.parent.exists(), f"  {CONFIG_PATH.parent}/  (config folder)"),
+    ]
+    found_any = False
+    for exists, label in items:
+        if exists:
+            print(label)
+            found_any = True
+
+    if not found_any:
+        print("  Nothing to remove — volkey doesn't appear to be installed.")
+        return
+
+    print()
+    answer = input("Are you sure? [y/N] ").strip().lower()
+    if answer != "y":
+        print("Aborted.")
+        return
+
+    if SERVICE_PATH.exists():
+        subprocess.run(["systemctl", "--user", "disable", "--now", "volkey.service"],
+                       capture_output=True)
+        SERVICE_PATH.unlink()
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        print("Removed service.")
+
+    if INSTALL_PATH.exists():
+        result = subprocess.run(["sudo", "rm", str(INSTALL_PATH)])
+        if result.returncode == 0:
+            print("Removed script.")
+
+    if CONFIG_PATH.parent.exists():
+        import shutil
+        shutil.rmtree(CONFIG_PATH.parent)
+        print("Removed config.")
+
+    print("\nvolkey uninstalled.")
+
+def _service_is_active() -> bool:
+    r = subprocess.run(
+        ["systemctl", "--user", "is-active", "volkey.service"],
+        capture_output=True, text=True
+    )
+    return r.stdout.strip() == "active"
+
+def _ensure_service_file():
+    """Install the service file if it isn't there yet."""
+    if not SERVICE_PATH.exists():
+        SERVICE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SERVICE_PATH.write_text(SERVICE_UNIT)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+
+def cmd_start(_args):
+    if _service_is_active():
+        print("volkey is already running.")
+        return
+    _ensure_service_file()
+    result = subprocess.run(
+        ["systemctl", "--user", "start", "volkey.service"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print("volkey started.")
+    else:
+        print("Failed to start volkey:")
+        print(result.stderr.strip())
+
+def cmd_stop(_args):
+    if not _service_is_active():
+        print("volkey is not running.")
+        return
+    result = subprocess.run(
+        ["systemctl", "--user", "stop", "volkey.service"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print("volkey stopped.")
+    else:
+        print("Failed to stop volkey:")
+        print(result.stderr.strip())
+
+def cmd_listen(_args):
+    """Internal command — called by the systemd service. Not for direct use."""
+    config = load_config()
+    start_listener(config)
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(prog="volkey", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("help")
+    sub.add_parser("version")
+    sub.add_parser("start")
+    sub.add_parser("stop")
+    sub.add_parser("_listen")
+    sub.add_parser("list")
+    sub.add_parser("apps")
+    sub.add_parser("keylist")
+    sub.add_parser("status")
+    sub.add_parser("config")
+    sub.add_parser("uninstall")
+
+    p_ku = sub.add_parser("keyset_up")
+    p_ku.add_argument("app",  help="App name, e.g. firefox")
+    p_ku.add_argument("keys", help="Modifier keys, e.g. ctrl or ctrl+alt")
+
+    p_kd = sub.add_parser("keyset_down")
+    p_kd.add_argument("app",  help="App name, e.g. firefox")
+    p_kd.add_argument("keys", help="Modifier keys, e.g. ctrl or ctrl+alt")
+
+    p_kru = sub.add_parser("keyrm_up")
+    p_kru.add_argument("app")
+
+    p_krd = sub.add_parser("keyrm_down")
+    p_krd.add_argument("app")
+
+    p_kr = sub.add_parser("keyrm")
+    p_kr.add_argument("app")
+
+    p_gran = sub.add_parser("granularity")
+    p_gran.add_argument("value", nargs="?", default=None, help="Step size 1-50, omit to show current")
+
+    p_auto = sub.add_parser("autostart")
+    p_auto.add_argument("action", nargs="?", choices=["on", "off"], default=None,
+                        help="on / off, omit to show current status")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        cmd_help(args)
+        return
+
+    {
+        "help":        cmd_help,
+        "version":     cmd_version,
+        "start":       cmd_start,
+        "stop":        cmd_stop,
+        "_listen":     cmd_listen,
+        "list":        cmd_list,
+        "apps":        cmd_apps,
+        "keylist":     cmd_keylist,
+        "keyset_up":   cmd_keyset_up,
+        "keyset_down": cmd_keyset_down,
+        "keyrm_up":    cmd_keyrm_up,
+        "keyrm_down":  cmd_keyrm_down,
+        "keyrm":       cmd_keyrm,
+        "granularity": cmd_granularity,
+        "autostart":   cmd_autostart,
+        "status":      cmd_status,
+        "config":      cmd_config,
+        "uninstall":   cmd_uninstall,
+    }[args.command](args)
+
+if __name__ == "__main__":
+    main()
